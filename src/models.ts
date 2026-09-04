@@ -8,7 +8,12 @@ export type ModelProviderConfig = Extract<
 >["provider"];
 export type ModelDefinitionConfig = ModelProviderConfig["models"][number];
 
-export const DEFAULT_BASE_URL = "http://localhost:8080/openai/v1";
+/**
+ * Bifrost's own unified API surface. `/openai/*` is a separate OpenAI-shaped
+ * passthrough namespace whose routes carry no `/v1` segment, and its model list
+ * is stripped of pricing and context limits, so `/v1` is the route to target.
+ */
+export const DEFAULT_BASE_URL = "http://localhost:8080/v1";
 
 /** Cache window for the live catalog, matching the SDK's own default. */
 export const MODEL_DISCOVERY_TTL_MS = 60_000;
@@ -69,15 +74,17 @@ function isSafeModelId(value: string): boolean {
 }
 
 /**
- * Bifrost exposes rich model metadata on its native `/v1/models` route only.
- * The OpenAI-compatible `{baseUrl}/models` mirror answers 200 but strips
- * `context_length` and `pricing`, and `{baseUrl}/v1/models` silently serves the
- * dashboard SPA — so the discovery URL is derived from the gateway root instead
- * of being appended to the base URL.
+ * Resolves discovery to the gateway's `/v1/models` route from any Bifrost base
+ * URL, rather than appending a path to the configured one.
+ *
+ * Rich model metadata lives only on `/v1/models`. Someone pointed at the
+ * `/openai` passthrough namespace instead would otherwise get `/openai/models`,
+ * which answers 200 but omits `context_length` and `pricing`, or
+ * `/openai/v1/models`, which answers 200 with the dashboard SPA.
  */
 export function resolveDiscoveryUrl(baseUrl: string): string {
   const trimmed = baseUrl.trim().replace(/\/+$/, "");
-  const root = trimmed.replace(/\/openai(?:\/v\d+)?$/, "");
+  const root = trimmed.replace(/(?:\/openai)?(?:\/v\d+)?$/, "");
   return `${root}/v1/models`;
 }
 

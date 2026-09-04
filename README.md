@@ -30,16 +30,16 @@ openclaw gateway restart
 The gateway URL goes in the plugin's own config section:
 
 ```bash
-openclaw config set plugins.entries.bifrost.config.baseUrl http://<host>:8080/openai/v1
+openclaw config set plugins.entries.bifrost.config.baseUrl http://<host>:8080/v1
 ```
 
-It defaults to `http://localhost:8080/openai/v1`. Onboarding sets the same value
+It defaults to `http://localhost:8080/v1`. Onboarding sets the same value
 from `--custom-base-url`:
 
 ```bash
 openclaw onboard --auth-choice bifrost-api-key \
   --bifrost-api-key <virtual-key> \
-  --custom-base-url http://<host>:8080/openai/v1
+  --custom-base-url http://<host>:8080/v1
 ```
 
 > **Why not `models.providers.bifrost.baseUrl`?** OpenClaw's config schema
@@ -81,11 +81,13 @@ context and zero cost).
 
 ### Model discovery endpoint
 
-Discovery targets the gateway root (`http://<host>:8080/v1/models`), derived from
-the configured base URL, rather than appending a path to it. Bifrost's
-OpenAI-compatible mirror at `{baseUrl}/models` answers `200` but omits
-`context_length` and `pricing`, and `{baseUrl}/v1/models` silently serves the
-dashboard SPA.
+Bifrost's `/v1` routes are its own unified API surface, and `/v1/models` is the
+only one carrying full model metadata. `/openai/*` is a separate OpenAI-shaped
+passthrough namespace whose routes have no `/v1` segment; its `/openai/models`
+answers `200` but omits `context_length` and `pricing`, and `/openai/v1/models`
+answers `200` with the dashboard SPA. Discovery therefore normalizes any
+configured base URL back to the gateway's `/v1/models`, so a deployment still
+pointed at `/openai/v1` keeps full metadata.
 
 ### Public SDK surface only
 

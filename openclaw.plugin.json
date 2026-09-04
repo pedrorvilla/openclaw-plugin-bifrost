@@ -43,7 +43,7 @@
     "properties": {
       "baseUrl": {
         "type": "string",
-        "description": "OpenAI-compatible base URL of the Bifrost gateway, e.g. http://192.168.0.102:8080/openai/v1. Defaults to http://localhost:8080/openai/v1."
+        "description": "Base URL of the Bifrost gateway's unified API, e.g. http://192.168.0.102:8080/v1. Defaults to http://localhost:8080/v1."
       }
     }
   },

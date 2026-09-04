@@ -147,7 +147,7 @@ export function registerBifrost(api: OpenClawPluginApi): void {
     noteMessage: [
       "Bifrost is an AI gateway that fronts many providers behind one OpenAI-compatible API.",
       `Set the gateway base URL if it is not ${DEFAULT_BASE_URL}:`,
-      "  openclaw config set plugins.entries.bifrost.config.baseUrl http://<host>:8080/openai/v1",
+      "  openclaw config set plugins.entries.bifrost.config.baseUrl http://<host>:8080/v1",
       "The virtual key is only required when 'Enable Auth on Inference' is on in Bifrost.",
     ].join("\n"),
     wizard: {

@@ -70,12 +70,17 @@ describe("registration", () => {
 });
 
 describe("resolveDiscoveryUrl", () => {
-  it("targets the gateway root, not the OpenAI-compatible sub-path", () => {
-    // `{baseUrl}/v1/models` answers 200 with the dashboard SPA, and
-    // `{baseUrl}/models` drops pricing and context limits.
-    expect(resolveDiscoveryUrl("http://gateway:8080/openai/v1")).toBe(
-      "http://gateway:8080/v1/models",
-    );
+  it("appends models to the gateway's own /v1 surface", () => {
+    expect(resolveDiscoveryUrl(DEFAULT_BASE_URL)).toBe("http://localhost:8080/v1/models");
+    expect(resolveDiscoveryUrl("http://gateway:8080/v1")).toBe("http://gateway:8080/v1/models");
+  });
+
+  it("redirects the /openai passthrough namespace back to /v1", () => {
+    // `/openai/models` drops pricing and context limits, and
+    // `/openai/v1/models` answers 200 with the dashboard SPA.
+    for (const baseUrl of ["http://gateway:8080/openai/v1", "http://gateway:8080/openai"]) {
+      expect(resolveDiscoveryUrl(baseUrl)).toBe("http://gateway:8080/v1/models");
+    }
   });
 
   it("tolerates trailing slashes and a bare gateway origin", () => {
@@ -166,7 +171,7 @@ describe("catalog", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const { port } = server.address() as AddressInfo;
     try {
-      await run(`http://127.0.0.1:${port}/openai/v1`, calls);
+      await run(`http://127.0.0.1:${port}/v1`, calls);
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
@@ -254,7 +259,7 @@ describe("catalog", () => {
         resolveProviderApiKey: () => ({}),
         config: {
           plugins: { entries: { bifrost: { config: { baseUrl } } } },
-          models: { providers: { bifrost: { baseUrl: "http://stale:1/openai/v1", models: [] } } },
+          models: { providers: { bifrost: { baseUrl: "http://stale:1/v1", models: [] } } },
         },
       });
       expect(result.provider.baseUrl).toBe(baseUrl);
@@ -290,7 +295,7 @@ describe("runtime model resolution", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const { port } = server.address() as AddressInfo;
     try {
-      await run(`http://127.0.0.1:${port}/openai/v1`);
+      await run(`http://127.0.0.1:${port}/v1`);
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
@@ -309,7 +314,7 @@ describe("runtime model resolution", () => {
   it("returns nothing before discovery has run", () => {
     const provider = registerProviders()[0];
     expect(
-      provider?.resolveDynamicModel?.(runtimeCtx("http://cold:8080/openai/v1", "a/b") as never),
+      provider?.resolveDynamicModel?.(runtimeCtx("http://cold:8080/v1", "a/b") as never),
     ).toBeNull();
   });
 
