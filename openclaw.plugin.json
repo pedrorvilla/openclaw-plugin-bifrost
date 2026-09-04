@@ -1,0 +1,59 @@
+{
+  "id": "bifrost",
+  "name": "Bifrost",
+  "description": "Adds the Bifrost AI gateway to OpenClaw as a first-class provider with live model discovery.",
+  "version": "0.1.0",
+  "providers": [
+    "bifrost"
+  ],
+  "modelCatalog": {
+    "discovery": {
+      "bifrost": "runtime"
+    }
+  },
+  "setup": {
+    "providers": [
+      {
+        "id": "bifrost",
+        "envVars": [
+          "BIFROST_API_KEY"
+        ]
+      }
+    ]
+  },
+  "providerAuthChoices": [
+    {
+      "provider": "bifrost",
+      "method": "api-key",
+      "choiceId": "bifrost-api-key",
+      "choiceLabel": "Bifrost virtual key",
+      "choiceHint": "AI gateway fronting many LLM providers",
+      "groupId": "bifrost",
+      "groupLabel": "Bifrost",
+      "groupHint": "AI gateway, OpenAI-compatible",
+      "optionKey": "bifrostApiKey",
+      "cliFlag": "--bifrost-api-key",
+      "cliOption": "--bifrost-api-key <key>",
+      "cliDescription": "Bifrost virtual key"
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "OpenAI-compatible base URL of the Bifrost gateway, e.g. http://192.168.0.102:8080/openai/v1. Defaults to http://localhost:8080/openai/v1."
+      }
+    }
+  },
+  "activation": {
+    "onStartup": true,
+    "providers": [
+      "bifrost"
+    ],
+    "capabilities": [
+      "provider"
+    ]
+  }
+}
