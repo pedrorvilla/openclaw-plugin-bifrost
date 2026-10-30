@@ -1,20 +1,20 @@
 {
   "id": "bifrost",
-  "name": "Bifrost",
+  "name": "Bifrost live discovery",
   "description": "Adds the Bifrost AI gateway to OpenClaw as a first-class provider with live model discovery.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "providers": [
-    "bifrost"
+    "bifrost-live"
   ],
   "modelCatalog": {
     "discovery": {
-      "bifrost": "runtime"
+      "bifrost-live": "runtime"
     }
   },
   "setup": {
     "providers": [
       {
-        "id": "bifrost",
+        "id": "bifrost-live",
         "envVars": [
           "BIFROST_API_KEY"
         ]
@@ -23,13 +23,13 @@
   },
   "providerAuthChoices": [
     {
-      "provider": "bifrost",
+      "provider": "bifrost-live",
       "method": "api-key",
-      "choiceId": "bifrost-api-key",
-      "choiceLabel": "Bifrost virtual key",
+      "choiceId": "bifrost-live-api-key",
+      "choiceLabel": "Bifrost live Virtual Key",
       "choiceHint": "AI gateway fronting many LLM providers",
-      "groupId": "bifrost",
-      "groupLabel": "Bifrost",
+      "groupId": "bifrost-live",
+      "groupLabel": "Bifrost live",
       "groupHint": "AI gateway, OpenAI-compatible",
       "optionKey": "bifrostApiKey",
       "cliFlag": "--bifrost-api-key",
@@ -44,13 +44,20 @@
       "baseUrl": {
         "type": "string",
         "description": "Base URL of the Bifrost gateway's unified API, e.g. http://192.168.0.102:8080/v1. Defaults to http://localhost:8080/v1."
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 30000,
+        "default": 5000,
+        "description": "Total deadline for a complete model listing."
       }
     }
   },
   "activation": {
     "onStartup": true,
     "providers": [
-      "bifrost"
+      "bifrost-live"
     ],
     "capabilities": [
       "provider"

@@ -15,9 +15,6 @@ export type ModelDefinitionConfig = ModelProviderConfig["models"][number];
  */
 export const DEFAULT_BASE_URL = "http://localhost:8080/v1";
 
-/** Cache window for the live catalog, matching the SDK's own default. */
-export const MODEL_DISCOVERY_TTL_MS = 60_000;
-
 /** Fallbacks for Bifrost rows that omit limits (models with no upstream metadata). */
 const FALLBACK_CONTEXT_WINDOW = 128_000;
 const FALLBACK_MAX_TOKENS = 8_192;
@@ -28,13 +25,9 @@ const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 const REASONING_MODEL_ID_PATTERN =
   /(?:^|[/_:.-])(?:reason(?:er|ing)?|thinking|deepseek-r1|o[134](?:-mini)?|gpt-5|gpt-oss)(?:$|[/_:.-])/i;
 
-/** Bifrost proxies image/audio/embedding models too; keep the text catalog clean. */
-const NON_TEXT_MODEL_ID_PATTERN =
-  /(?:^|[/_:.-])(?:embed(?:ding)?|rerank(?:er)?|whisper|transcri(?:be|ption)|tts|speech|moderation|guard|gpt-image|dall-e|flux|sdxl|stable-diffusion|imagen|image-gen(?:eration)?|text-to-image|veo|sora|video-gen(?:eration)?|text-to-video)(?:$|[/_:.-])/i;
-
 /**
- * Bifrost only fronts text models here, and the runtime model type accepts a
- * narrower input set than the catalog config type, so pin it.
+ * OpenClaw's text runner supports text/image inputs. Listing a model does not
+ * imply that this plugin implements its embedding, audio or image-generation API.
  */
 export type BifrostModel = ModelDefinitionConfig & { input: ("text" | "image")[] };
 
@@ -83,9 +76,13 @@ function isSafeModelId(value: string): boolean {
  * `/openai/v1/models`, which answers 200 with the dashboard SPA.
  */
 export function resolveDiscoveryUrl(baseUrl: string): string {
-  const trimmed = baseUrl.trim().replace(/\/+$/, "");
-  const root = trimmed.replace(/(?:\/openai)?(?:\/v\d+)?$/, "");
-  return `${root}/v1/models`;
+  const url = new URL(baseUrl.trim());
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error("Bifrost baseUrl must be an HTTP(S) URL without credentials, query or fragment");
+  }
+  const root = url.pathname.replace(/\/+$/, "").replace(/(?:\/openai)?(?:\/v\d+)?$/, "");
+  url.pathname = `${root}/v1/models`;
+  return url.toString();
 }
 
 /** Projects one Bifrost `/v1/models` row into an OpenClaw catalog model. */
@@ -93,7 +90,6 @@ export function projectBifrostModel(row: unknown): BifrostModel | undefined {
   const record = asRecord(row);
   const id = readString(record, ["id", "model", "model_name"]);
   if (!record || !id || !isSafeModelId(id)) return undefined;
-  if (NON_TEXT_MODEL_ID_PATTERN.test(id)) return undefined;
 
   const contextWindow =
     readPositiveInteger(record, ["context_length", "max_input_tokens"]) ?? FALLBACK_CONTEXT_WINDOW;
@@ -123,30 +119,4 @@ export function projectBifrostModels(rows: unknown[]): BifrostModel[] {
   return [...new Map(models.map((model) => [model.id, model])).values()].sort((left, right) =>
     left.id.localeCompare(right.id),
   );
-}
-
-/**
- * Models seen by the most recent discovery, keyed by gateway base URL.
- *
- * OpenClaw resolves a model at request time through `resolveDynamicModel`, a
- * synchronous hook, so the projected rows are kept here by the catalog run (and
- * refreshed by `prepareDynamicModel`) instead of being re-fetched inline.
- */
-const discoveredModels = new Map<string, ReadonlyMap<string, BifrostModel>>();
-
-export function rememberDiscoveredModels(
-  baseUrl: string,
-  models: readonly BifrostModel[],
-): void {
-  if (models.length === 0) return;
-  discoveredModels.set(baseUrl, new Map(models.map((model) => [model.id, model])));
-}
-
-export function readDiscoveredModel(baseUrl: string, modelId: string): BifrostModel | undefined {
-  return discoveredModels.get(baseUrl)?.get(modelId);
-}
-
-/** Test seam; discovery state is process-local and otherwise never cleared. */
-export function clearDiscoveredModels(): void {
-  discoveredModels.clear();
 }

@@ -1,373 +1,276 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi, ProviderPlugin } from "openclaw/plugin-sdk/plugin-entry";
+
+// Only auth storage is mocked: tests never read the user's profiles or keys.
+// Discovery uses the actual OpenClaw 2026.10.9 guarded HTTP implementation.
+const { lookup } = vi.hoisted(() => ({ lookup: vi.fn() }));
+vi.mock("openclaw/plugin-sdk/provider-auth-runtime", () => ({ resolveApiKeyForProvider: lookup }));
 import entry from "./index.js";
-import {
-  DEFAULT_BASE_URL,
-  clearDiscoveredModels,
-  projectBifrostModels,
-  resolveDiscoveryUrl,
-} from "./models.js";
+import { DEFAULT_BASE_URL, projectBifrostModels, resolveDiscoveryUrl } from "./models.js";
+import { discoverModels } from "./discovery.js";
 
-/** A trimmed capture of a real `GET http://<gateway>/v1/models` response. */
-const BIFROST_ROWS = [
-  {
-    id: "cerebras/gemma-4-31b",
-    normalized_name: "Gemma 4 31B",
-    created: 0,
-    context_length: 131072,
-    max_input_tokens: 131072,
-    max_output_tokens: 40960,
-    pricing: { prompt: "0.0000009900", completion: "0.0000014900" },
-    owned_by: "Cerebras",
-  },
-  {
-    id: "cerebras/gpt-oss-120b",
-    normalized_name: "Gpt Oss 120B",
-    created: 0,
-    context_length: 131072,
-    max_input_tokens: 131072,
-    max_output_tokens: 32768,
-    pricing: { prompt: "0.0000003500", completion: "0.0000007500" },
-    owned_by: "Cerebras",
-  },
-  // Real gateways return rows with no limits and no pricing at all.
-  { id: "cerebras/qwen-3.8-27b", created: 0, owned_by: "Cerebras" },
-];
+const KEY_A = "sk-bf-fixture-a";
+const KEY_B = "sk-bf-fixture-b";
+const rows = [{ id: "vendor/a" }, { id: "vendor/b", context_length: 10000, max_output_tokens: 2000,
+  normalized_name: "Model B", pricing: { prompt: "0.00000035", completion: "0.00000075" } }];
 
-function registerProviders(): ProviderPlugin[] {
+function registered() {
   const providers: ProviderPlugin[] = [];
-  const api = {
-    registerProvider(provider: ProviderPlugin) {
-      providers.push(provider);
-    },
-  } as Partial<OpenClawPluginApi>;
-  entry.register(api as OpenClawPluginApi);
-  return providers;
+  const warn = vi.fn();
+  entry.register({ registerProvider: (p: ProviderPlugin) => providers.push(p), logger: { warn } } as unknown as OpenClawPluginApi);
+  expect(providers).toHaveLength(1);
+  return { provider: providers[0]!, warn };
 }
 
-beforeEach(() => {
-  clearDiscoveredModels();
-});
+function config(baseUrl: string, extra = {}) {
+  return { plugins: { entries: { bifrost: { config: { baseUrl, ...extra } } } } };
+}
+function catalogCtx(baseUrl: string, key: string | undefined = KEY_A) {
+  return { config: config(baseUrl), env: {}, providerIds: ["bifrost-live"],
+    resolveProviderApiKey: vi.fn<() => { apiKey: string | undefined }>(() => ({ apiKey: key })) };
+}
+function runtimeCtx(baseUrl: string, modelId = "vendor/a") {
+  return { config: config(baseUrl), provider: "bifrost-live", modelId, modelRegistry: {} as never,
+    agentDir: "/isolated-test-agent", workspaceDir: "/isolated-test-workspace" };
+}
+async function catalog(provider: ProviderPlugin, ctx: unknown): Promise<any> {
+  return provider.catalog!.run(ctx as never);
+}
+async function prepare(provider: ProviderPlugin, baseUrl: string, modelId = "vendor/a") {
+  return provider.prepareDynamicModel!(runtimeCtx(baseUrl, modelId) as never);
+}
+async function authorize(provider: ProviderPlugin, baseUrl: string, key = KEY_A, modelId = "vendor/a") {
+  return provider.prepareRuntimeAuth!({ ...runtimeCtx(baseUrl, modelId), apiKey: key, env: {}, authMode: "api-key",
+    model: { id: modelId, provider: "bifrost-live", baseUrl, api: "openai-completions" } } as never);
+}
 
-describe("registration", () => {
-  it("registers a single bifrost provider with API-key auth", () => {
-    const providers = registerProviders();
-    expect(providers.map((provider) => provider.id)).toEqual(["bifrost"]);
-    expect(providers[0]?.label).toBe("Bifrost");
-    expect(providers[0]?.envVars).toEqual(["BIFROST_API_KEY"]);
-    expect(providers[0]?.auth).toMatchObject([{ id: "api-key", kind: "api_key" }]);
+type Handler = (req: IncomingMessage, res: ServerResponse) => void;
+async function withGateway(run: (gateway: {
+  baseUrl: string; calls: { url: string; authorization?: string }[]; setHandler: (handler: Handler) => void;
+}) => Promise<void>) {
+  let handler: Handler = (_req, res) => json(res, { data: rows });
+  const calls: { url: string; authorization?: string }[] = [];
+  const server = createServer((req, res) => {
+    calls.push({ url: req.url ?? "", authorization: req.headers.authorization });
+    handler(req, res);
   });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  try { await run({ baseUrl, calls, setHandler: (value) => { handler = value; } }); }
+  finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
+}
+function json(res: ServerResponse, body: unknown, status = 200) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
 
-  it("serves a static catalog without contacting the gateway", async () => {
-    const provider = registerProviders()[0];
-    await expect(provider?.staticCatalog?.run({} as never)).resolves.toEqual({
-      provider: { api: "openai-completions", baseUrl: DEFAULT_BASE_URL, models: [] },
-    });
+beforeEach(() => { lookup.mockReset().mockResolvedValue({ apiKey: KEY_A }); });
+
+describe("registration and projection", () => {
+  it("registers the isolated live provider, preserving literal upstream ids", async () => {
+    const { provider } = registered();
+    expect(provider).toMatchObject({ id: "bifrost-live", preserveLiteralProviderPrefix: true, envVars: ["BIFROST_API_KEY"] });
+    expect(provider.auth).toMatchObject([{ id: "api-key", kind: "api_key" }]);
+    expect(await provider.staticCatalog!.run({} as never)).toEqual({ provider: { api: "openai-completions", baseUrl: DEFAULT_BASE_URL, models: [] } });
+    expect(provider.resolveDynamicModel!(runtimeCtx(DEFAULT_BASE_URL) as never)).toBeNull();
   });
-});
-
-describe("resolveDiscoveryUrl", () => {
-  it("appends models to the gateway's own /v1 surface", () => {
-    expect(resolveDiscoveryUrl(DEFAULT_BASE_URL)).toBe("http://localhost:8080/v1/models");
-    expect(resolveDiscoveryUrl("http://gateway:8080/v1")).toBe("http://gateway:8080/v1/models");
+  it.each(["", "/", "/v1/", "/openai", "/openai/v1"])("normalizes route %s", (suffix) => {
+    expect(resolveDiscoveryUrl(`https://gateway.example/prefix${suffix}`)).toBe("https://gateway.example/prefix/v1/models");
   });
-
-  it("redirects the /openai passthrough namespace back to /v1", () => {
-    // `/openai/models` drops pricing and context limits, and
-    // `/openai/v1/models` answers 200 with the dashboard SPA.
-    for (const baseUrl of ["http://gateway:8080/openai/v1", "http://gateway:8080/openai"]) {
-      expect(resolveDiscoveryUrl(baseUrl)).toBe("http://gateway:8080/v1/models");
-    }
+  it.each(["file:///tmp/data", "https://user:secret@gateway/v1", "https://gateway/v1?q=secret", "https://gateway/v1#secret"])("rejects unsafe base URL %s", (url) => {
+    expect(() => resolveDiscoveryUrl(url)).toThrow();
   });
-
-  it("tolerates trailing slashes and a bare gateway origin", () => {
-    expect(resolveDiscoveryUrl("http://gateway:8080/openai/v1/")).toBe(
-      "http://gateway:8080/v1/models",
-    );
-    expect(resolveDiscoveryUrl("http://gateway:8080")).toBe("http://gateway:8080/v1/models");
+  it("keeps all valid authorized ids without guessing capabilities from the name", () => {
+    const result = projectBifrostModels([...rows, { id: "openai/text-embedding-3-small" }, { id: "vendor/guard-chat" },
+      { id: "openai/whisper-1" }, { id: "vendor/a", context_length: 4000 }, { id: "bad\nid" }, {}, "bad"]);
+    expect(result.map((m) => m.id)).toEqual(["openai/text-embedding-3-small", "openai/whisper-1", "vendor/a", "vendor/b", "vendor/guard-chat"]);
+    expect(result.find((m) => m.id === "vendor/a")!.contextWindow).toBe(4000);
+    expect(result.find((m) => m.id === "vendor/b")).toMatchObject({ name: "Model B", contextWindow: 10000, maxTokens: 2000,
+      cost: { input: 0.35, output: 0.75, cacheRead: 0, cacheWrite: 0 } });
   });
-});
-
-describe("projectBifrostModels", () => {
-  const models = projectBifrostModels(BIFROST_ROWS);
-
-  it("keeps the provider-qualified id verbatim", () => {
-    // OpenClaw resolves the full ref as bifrost/cerebras/gpt-oss-120b.
-    expect(models.map((model) => model.id)).toEqual([
-      "cerebras/gemma-4-31b",
-      "cerebras/gpt-oss-120b",
-      "cerebras/qwen-3.8-27b",
-    ]);
-  });
-
-  it("converts per-token prices to USD per million tokens", () => {
-    expect(models[1]).toMatchObject({
-      name: "Gpt Oss 120B",
-      cost: { input: 0.35, output: 0.75, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 131072,
-      maxTokens: 32768,
-    });
-  });
-
-  it("falls back to zero cost and default limits for rows without metadata", () => {
-    expect(models[2]).toEqual({
-      id: "cerebras/qwen-3.8-27b",
-      name: "cerebras/qwen-3.8-27b",
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000,
-      maxTokens: 8192,
-    });
-  });
-
-  it("infers reasoning from the model id", () => {
-    expect(models.map((model) => model.reasoning)).toEqual([false, true, false]);
-  });
-
-  it("drops non-text models and unusable ids", () => {
-    expect(
-      projectBifrostModels([
-        { id: "openai/text-embedding-3-small" },
-        { id: "openai/whisper-1" },
-        { id: "black-forest-labs/flux-1.1-pro" },
-        { id: "bad\nid" },
-        { id: "" },
-        {},
-        "not-a-row",
-      ]),
-    ).toEqual([]);
-  });
-
-  it("de-duplicates ids and sorts the catalog", () => {
-    const projected = projectBifrostModels([
-      { id: "z/model", context_length: 1000 },
-      { id: "a/model", context_length: 1000 },
-      { id: "z/model", context_length: 2000 },
-    ]);
-    expect(projected.map((model) => model.id)).toEqual(["a/model", "z/model"]);
-    expect(projected[1]?.contextWindow).toBe(2000);
+  it("defaults missing metadata without inventing ids", () => {
+    expect(projectBifrostModels([{ id: "vendor/a" }])[0]).toMatchObject({ input: ["text"], contextWindow: 128000, maxTokens: 8192 });
+    expect(projectBifrostModels([{ id: "" }, { id: "x".repeat(513) }, null])).toEqual([]);
   });
 });
 
-describe("catalog", () => {
-  /**
-   * Discovery runs through the SDK's SSRF-guarded fetch, which does its own DNS
-   * resolution, so these tests serve the fixture from a real loopback server
-   * instead of stubbing `globalThis.fetch`.
-   */
-  async function withGateway(
-    handler: (req: IncomingMessage, res: ServerResponse) => void,
-    run: (baseUrl: string, calls: { url: string; authorization?: string }[]) => Promise<void>,
-  ) {
-    const calls: { url: string; authorization?: string }[] = [];
-    const server = createServer((req, res) => {
-      calls.push({ url: req.url ?? "", authorization: req.headers.authorization });
-      handler(req, res);
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const { port } = server.address() as AddressInfo;
-    try {
-      await run(`http://127.0.0.1:${port}/v1`, calls);
-    } finally {
-      await new Promise((resolve) => server.close(resolve));
-    }
-  }
-
-  function serveModels(_req: IncomingMessage, res: ServerResponse) {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ data: BIFROST_ROWS }));
-  }
-
-  function runCatalog(ctx: Record<string, unknown>) {
-    const provider = registerProviders()[0];
-    if (!provider?.catalog) throw new Error("bifrost provider registered no catalog");
-    return provider.catalog.run(ctx as never) as Promise<any>;
-  }
-
-  /** Base URL configured the supported way: the plugin's own config section. */
-  function catalogCtx(baseUrl: string | undefined, apiKey?: string) {
-    return {
-      providerIds: ["bifrost"],
-      env: {},
-      resolveProviderApiKey: () => (apiKey ? { apiKey } : {}),
-      config: baseUrl
-        ? { plugins: { entries: { bifrost: { config: { baseUrl } } } } }
-        : {},
-    };
-  }
-
-  it("skips work when the catalog is scoped to other providers", async () => {
-    await expect(runCatalog({ providerIds: ["openai"], config: {} })).resolves.toBeNull();
-  });
-
-  it("discovers models unauthenticated when gateway auth is off", async () => {
-    await withGateway(serveModels, async (baseUrl, calls) => {
-      const result = await runCatalog(catalogCtx(baseUrl));
-      // Discovery must hit the gateway root, not `{baseUrl}/v1/models`.
-      expect(calls[0]?.url).toBe("/v1/models");
-      expect(calls[0]?.authorization).toBeUndefined();
-      expect(result.provider.apiKey).toBeUndefined();
-      expect(result.provider.baseUrl).toBe(baseUrl);
-      expect(result.provider.models.map((model: any) => model.id)).toEqual([
-        "cerebras/gemma-4-31b",
-        "cerebras/gpt-oss-120b",
-        "cerebras/qwen-3.8-27b",
-      ]);
-      expect(result.provider.models[1]).toMatchObject({
-        cost: { input: 0.35, output: 0.75 },
-        contextWindow: 131072,
-        maxTokens: 32768,
-      });
-    });
-  });
-
-  it("sends the virtual key as a bearer token and keeps it on the provider", async () => {
-    await withGateway(serveModels, async (baseUrl, calls) => {
-      const result = await runCatalog(catalogCtx(baseUrl, "bifrost-virtual-key"));
-      expect(calls[0]?.authorization).toBe("Bearer bifrost-virtual-key");
-      expect(result.provider.apiKey).toBe("bifrost-virtual-key");
-    });
-  });
-
-  it("falls back to the default base URL when none is configured", async () => {
-    const result = await runCatalog(catalogCtx(undefined));
-    expect(result.provider.baseUrl).toBe(DEFAULT_BASE_URL);
-  });
-
-  it("still honours a hand-written models.providers.bifrost overlay", async () => {
-    await withGateway(serveModels, async (baseUrl) => {
-      const result = await runCatalog({
-        providerIds: ["bifrost"],
-        env: {},
-        resolveProviderApiKey: () => ({}),
-        config: { models: { providers: { BIFROST: { baseUrl, models: [] } } } },
-      });
-      expect(result.provider.baseUrl).toBe(baseUrl);
-      expect(result.provider.models).toHaveLength(3);
-    });
-  });
-
-  it("prefers the plugin config base URL over a provider overlay", async () => {
-    await withGateway(serveModels, async (baseUrl) => {
-      const result = await runCatalog({
-        providerIds: ["bifrost"],
-        env: {},
-        resolveProviderApiKey: () => ({}),
-        config: {
-          plugins: { entries: { bifrost: { config: { baseUrl } } } },
-          models: { providers: { bifrost: { baseUrl: "http://stale:1/v1", models: [] } } },
-        },
-      });
-      expect(result.provider.baseUrl).toBe(baseUrl);
-      expect(result.provider.models).toHaveLength(3);
-    });
-  });
-
-  it("keeps the provider usable when discovery fails", async () => {
-    await withGateway(
-      (_req, res) => {
-        res.writeHead(500);
-        res.end("upstream unavailable");
-      },
-      async (baseUrl) => {
-        const result = await runCatalog(catalogCtx(baseUrl));
-        expect(result.provider).toMatchObject({ api: "openai-completions", baseUrl });
-        expect(result.provider.models).toEqual([]);
-      },
-    );
-  });
+describe("live discovery with real SDK HTTP", () => {
+  it("uses /v1/models and the resolved discovery key, retaining only the host marker", async () => withGateway(async ({ baseUrl, calls }) => {
+    const { provider } = registered();
+    const ctx = { ...catalogCtx(baseUrl), resolveProviderApiKey: () => ({ apiKey: "BIFROST_API_KEY", discoveryApiKey: KEY_A }) };
+    const result = await catalog(provider, ctx);
+    expect(calls).toEqual([{ url: "/v1/models", authorization: `Bearer ${KEY_A}` }]);
+    expect(result.provider.apiKey).toBe("BIFROST_API_KEY");
+    expect(JSON.stringify(result)).not.toContain(KEY_A);
+    expect(result.provider.models).toHaveLength(2);
+  }));
+  it("replaces additions, removals and an empty permission set immediately", async () => withGateway(async ({ baseUrl, setHandler }) => {
+    const { provider } = registered(); const ctx = catalogCtx(baseUrl);
+    expect((await catalog(provider, ctx)).provider.models).toHaveLength(2);
+    setHandler((_req, res) => json(res, { data: [{ id: "vendor/c" }] }));
+    expect((await catalog(provider, ctx)).provider.models.map((m: any) => m.id)).toEqual(["vendor/c"]);
+    setHandler((_req, res) => json(res, { data: [] }));
+    expect((await catalog(provider, ctx)).provider.models).toEqual([]);
+    await expect(prepare(provider, baseUrl)).rejects.toThrow("not in the current Virtual Key catalog");
+  }));
+  it("rotates and removes keys without reusing a URL's previous key", async () => withGateway(async ({ baseUrl, calls, setHandler }) => {
+    setHandler((req, res) => json(res, { data: [{ id: req.headers.authorization === `Bearer ${KEY_A}` ? "vendor/a" : "vendor/b" }] }));
+    const { provider } = registered();
+    expect((await catalog(provider, catalogCtx(baseUrl, KEY_A))).provider.models[0].id).toBe("vendor/a");
+    expect((await catalog(provider, catalogCtx(baseUrl, KEY_B))).provider.models[0].id).toBe("vendor/b");
+    const missing = catalogCtx(baseUrl); missing.resolveProviderApiKey.mockReturnValue({ apiKey: undefined });
+    const result = await catalog(provider, missing);
+    expect(result.provider.models).toEqual([]); expect(result.outcomes[0].status).toBe("auth-rejected");
+    expect(calls.map((c) => c.authorization)).toEqual([`Bearer ${KEY_A}`, `Bearer ${KEY_B}`]);
+  }));
+  it("discards an in-flight catalog if its credential changes", async () => withGateway(async ({ baseUrl, setHandler, calls }) => {
+    let key = KEY_A;
+    setHandler((req, res) => { const old = req.headers.authorization === `Bearer ${KEY_A}`; key = KEY_B;
+      json(res, { data: [{ id: old ? "vendor/a" : "vendor/b" }] }); });
+    const { provider } = registered();
+    const result = await catalog(provider, { ...catalogCtx(baseUrl), resolveProviderApiKey: () => ({ apiKey: key }) });
+    expect(result.provider.models.map((m: any) => m.id)).toEqual(["vendor/b"]); expect(calls).toHaveLength(2);
+  }));
+  it("isolates concurrent catalogs for two credentials on one endpoint", async () => withGateway(async ({ baseUrl, setHandler }) => {
+    setHandler((req, res) => json(res, { data: [{ id: req.headers.authorization === `Bearer ${KEY_A}` ? "vendor/a" : "vendor/b" }] }));
+    const { provider } = registered();
+    const [a, b] = await Promise.all([catalog(provider, catalogCtx(baseUrl, KEY_A)), catalog(provider, catalogCtx(baseUrl, KEY_B))]);
+    expect(a.provider.models[0].id).toBe("vendor/a"); expect(b.provider.models[0].id).toBe("vendor/b");
+  }));
+  it.each([401, 403, 429, 500, 503])("clears prior results on HTTP %i without anonymous retry or response leakage", async (status) => withGateway(async ({ baseUrl, calls, setHandler }) => {
+    const { provider, warn } = registered(); const ctx = catalogCtx(baseUrl);
+    expect((await catalog(provider, ctx)).provider.models).toHaveLength(2);
+    setHandler((_req, res) => json(res, { error: `secret ${KEY_A}` }, status));
+    const result = await catalog(provider, ctx);
+    expect(result.provider.models).toEqual([]);
+    expect(result.outcomes[0].status).toBe(status === 401 || status === 403 ? "auth-rejected" : "unavailable");
+    expect(calls).toHaveLength(2); expect(JSON.stringify(warn.mock.calls)).not.toContain(KEY_A);
+    await expect(authorize(provider, baseUrl)).rejects.toThrow("Bifrost live:");
+    setHandler((_req, res) => json(res, { data: rows }));
+    expect((await catalog(provider, ctx)).provider.models).toHaveLength(2);
+  }));
+  it.each(["<html>dashboard</html>", "{broken", JSON.stringify({ models: rows }), JSON.stringify({ error: "bad" })])("rejects malformed envelope %s", async (body) => withGateway(async ({ baseUrl, setHandler }) => {
+    setHandler((_req, res) => res.end(body));
+    const result = await catalog(registered().provider, catalogCtx(baseUrl));
+    expect(result.provider.models).toEqual([]); expect(result.outcomes[0].status).toBe("unavailable");
+  }));
+  it("times out a hung request and does not keep previous rows", async () => withGateway(async ({ baseUrl, setHandler }) => {
+    const { provider } = registered(); const ctx = { ...catalogCtx(baseUrl), config: config(baseUrl, { timeoutMs: 100 }) };
+    await catalog(provider, ctx); setHandler(() => {});
+    const start = Date.now(); const result = await catalog(provider, ctx);
+    expect(Date.now() - start).toBeLessThan(2000); expect(result.provider.models).toEqual([]);
+  }));
+  it("handles network disconnects", async () => withGateway(async ({ baseUrl, setHandler }) => {
+    setHandler((req) => req.socket.destroy());
+    expect((await catalog(registered().provider, catalogCtx(baseUrl))).provider.models).toEqual([]);
+  }));
+  it("joins all pages before publishing and rejects incomplete pagination", async () => withGateway(async ({ baseUrl, setHandler }) => {
+    setHandler((req, res) => json(res, req.url?.includes("after=") ? { data: [{ id: "vendor/b" }] } : { data: [{ id: "vendor/a" }], has_more: true, next_cursor: "page2" }));
+    const { provider } = registered(); const ctx = catalogCtx(baseUrl);
+    expect((await catalog(provider, ctx)).provider.models.map((m: any) => m.id)).toEqual(["vendor/a", "vendor/b"]);
+    setHandler((_req, res) => json(res, { data: [{ id: "vendor/a" }], has_more: true }));
+    const result = await catalog(provider, ctx); expect(result.provider.models).toEqual([]); expect(result.outcomes[0].status).toBe("unavailable");
+  }));
+  it("rejects redirects instead of accepting an anonymous destination catalog", async () => withGateway(async ({ baseUrl, calls, setHandler }) => {
+    setHandler((_req, res) => { res.writeHead(302, { Location: `${baseUrl}/redirected` }); res.end(); });
+    const result = await catalog(registered().provider, catalogCtx(baseUrl));
+    expect(result.provider.models).toEqual([]); expect(calls).toHaveLength(1);
+  }));
+  it("propagates cancellation without publishing a partial catalog", async () => withGateway(async ({ baseUrl }) => {
+    const controller = new AbortController(); controller.abort();
+    await expect(discoverModels({ baseUrl, apiKey: KEY_A, timeoutMs: 500, signal: controller.signal })).rejects.toThrow();
+  }));
+  it.each([undefined, "", "legacy-key", "BIFROST_API_KEY", "sk-bf-bad\nkey"])("never makes an anonymous request for invalid credential %s", async (key) => withGateway(async ({ baseUrl, calls }) => {
+    await expect(discoverModels({ baseUrl, apiKey: key, timeoutMs: 500 })).rejects.toThrow("Virtual Key"); expect(calls).toHaveLength(0);
+  }));
 });
 
-describe("runtime model resolution", () => {
-  /**
-   * OpenClaw resolves a model per request through these hooks rather than the
-   * catalog, so without them every Bifrost model falls back to generic defaults.
-   */
-  async function withGateway(run: (baseUrl: string) => Promise<void>) {
-    const server = createServer((_req, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ data: BIFROST_ROWS }));
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const { port } = server.address() as AddressInfo;
-    try {
-      await run(`http://127.0.0.1:${port}/v1`);
-    } finally {
-      await new Promise((resolve) => server.close(resolve));
-    }
-  }
-
-  function runtimeCtx(baseUrl: string, modelId: string) {
-    return {
-      provider: "bifrost",
-      modelId,
-      providerConfig: { baseUrl },
-      modelRegistry: {} as never,
-      config: {},
-    };
-  }
-
-  it("returns nothing before discovery has run", () => {
-    const provider = registerProviders()[0];
-    expect(
-      provider?.resolveDynamicModel?.(runtimeCtx("http://cold:8080/v1", "a/b") as never),
-    ).toBeNull();
-  });
-
-  it("prepares a model from the gateway, then serves it synchronously", async () => {
-    await withGateway(async (baseUrl) => {
-      const provider = registerProviders()[0];
-      const ctx = runtimeCtx(baseUrl, "cerebras/gpt-oss-120b") as never;
-
-      const prepared: any = await provider?.prepareDynamicModel?.(ctx);
-      expect(prepared).toMatchObject({
-        id: "cerebras/gpt-oss-120b",
-        provider: "bifrost",
-        api: "openai-completions",
-        baseUrl,
-        contextWindow: 131072,
-        contextTokens: 131072,
-        maxTokens: 32768,
-        cost: { input: 0.35, output: 0.75 },
-      });
-
-      // The sync hook is what the runner calls on later turns.
-      expect(provider?.resolveDynamicModel?.(ctx)).toMatchObject({
-        id: "cerebras/gpt-oss-120b",
-        contextTokens: 131072,
-      });
-    });
-  });
-
-  it("does not invent models the gateway never returned", async () => {
-    await withGateway(async (baseUrl) => {
-      const provider = registerProviders()[0];
-      const ctx = runtimeCtx(baseUrl, "cerebras/does-not-exist") as never;
-      await expect(provider?.prepareDynamicModel?.(ctx)).resolves.toBeUndefined();
-      expect(provider?.resolveDynamicModel?.(ctx)).toBeNull();
-    });
-  });
-
-  it("resolves without a reachable gateway once the catalog has run", async () => {
-    let baseUrl = "";
-    await withGateway(async (url) => {
-      baseUrl = url;
-      const provider = registerProviders()[0];
-      await provider?.catalog?.run({
-        providerIds: ["bifrost"],
-        env: {},
-        resolveProviderApiKey: () => ({}),
-        config: { plugins: { entries: { bifrost: { config: { baseUrl } } } } },
-      } as never);
-    });
-    // Gateway is down again here; the catalog run already cached the rows.
-    const provider = registerProviders()[0];
-    expect(
-      provider?.resolveDynamicModel?.(runtimeCtx(baseUrl, "cerebras/gemma-4-31b") as never),
-    ).toMatchObject({ id: "cerebras/gemma-4-31b", contextTokens: 131072 });
+describe("runtime and safe coexistence", () => {
+  it("re-resolves auth for every runtime discovery and honors a locked profile", async () => withGateway(async ({ baseUrl, calls, setHandler }) => {
+    const { provider } = registered();
+    expect(await prepare(provider, baseUrl)).toMatchObject({ id: "vendor/a", provider: "bifrost-live", contextTokens: 128000 });
+    lookup.mockResolvedValue({ apiKey: KEY_B, profileId: "bifrost-live:rotated" });
+    setHandler((_req, res) => json(res, { data: [{ id: "vendor/b" }] }));
+    await expect(provider.prepareDynamicModel!({ ...runtimeCtx(baseUrl), authProfileId: "bifrost-live:rotated" } as never)).rejects.toThrow("not in the current");
+    expect(lookup).toHaveBeenLastCalledWith(expect.objectContaining({ profileId: "bifrost-live:rotated", lockedProfile: true, secretSentinels: false }));
+    expect(calls.map((c) => c.authorization)).toEqual([`Bearer ${KEY_A}`, `Bearer ${KEY_B}`]);
+  }));
+  it("rechecks the actual inference credential even if a registry row exists", async () => withGateway(async ({ baseUrl, calls, setHandler }) => {
+    const { provider } = registered(); await prepare(provider, baseUrl);
+    setHandler((req, res) => json(res, { data: req.headers.authorization === `Bearer ${KEY_B}` ? [] : rows }));
+    await expect(authorize(provider, baseUrl, KEY_B)).rejects.toThrow("not in the current");
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${KEY_B}`);
+    expect(await authorize(provider, baseUrl, KEY_A)).toEqual({ apiKey: KEY_A, baseUrl });
+  }));
+  it("does not recover deleted auth from the catalog", async () => withGateway(async ({ baseUrl, calls }) => {
+    const { provider } = registered(); await catalog(provider, catalogCtx(baseUrl)); lookup.mockResolvedValue({});
+    await expect(prepare(provider, baseUrl)).rejects.toThrow("Virtual Key"); expect(calls).toHaveLength(1);
+  }));
+  it("fails closed on credential resolver errors", async () => withGateway(async ({ baseUrl, calls }) => {
+    const { provider } = registered(); lookup.mockRejectedValue(new Error("auth unavailable"));
+    await expect(prepare(provider, baseUrl)).rejects.toThrow(); expect(calls).toHaveLength(0);
+  }));
+  it("does not mutate or import a legacy static catalog or credential", async () => withGateway(async ({ baseUrl, calls }) => {
+    const ctx = catalogCtx(baseUrl);
+    const legacy = { models: { providers: { bifrost: { baseUrl, apiKey: "legacy-secret", headers: { "X-Existing": "keep" },
+      models: [{ id: "vendor/revoked", name: "Legacy" }] }, other: { baseUrl: "https://other.invalid", models: [] } } } };
+    ctx.config = { ...ctx.config, ...legacy }; const before = structuredClone(ctx.config);
+    const { provider } = registered(); const result = await catalog(provider, ctx);
+    expect(result.provider.models.map((m: any) => m.id)).toEqual(["vendor/a", "vendor/b"]);
+    expect(ctx.config).toEqual(before); expect(JSON.stringify(result)).not.toContain("legacy-secret");
+    expect(calls[0]?.authorization).toBe(`Bearer ${KEY_A}`);
+  }));
+  it("uses only the legacy URL as a fallback", async () => withGateway(async ({ baseUrl }) => {
+    const result = await catalog(registered().provider, { ...catalogCtx(baseUrl), config: {
+      models: { providers: { BIFROST: { baseUrl, models: [{ id: "vendor/stale" }] } } },
+    } });
+    expect(result.provider.baseUrl).toBe(baseUrl); expect(result.provider.models).toHaveLength(2);
+  }));
+  it.each([{ headers: { Authorization: "stale" } }, { authHeader: false }])("refuses live credential overrides %j", async (extra) => withGateway(async ({ baseUrl, calls }) => {
+    const result = await catalog(registered().provider, { ...catalogCtx(baseUrl), config: { ...config(baseUrl),
+      models: { providers: { "bifrost-live": { baseUrl, models: [], ...extra } } } } });
+    expect(result.provider.models).toEqual([]); expect(calls).toHaveLength(0);
+  }));
+  it("bounds retries during constant credential churn", async () => withGateway(async ({ baseUrl, calls }) => {
+    let n = 0;
+    const result = await catalog(registered().provider, { ...catalogCtx(baseUrl),
+      resolveProviderApiKey: () => ({ apiKey: n++ % 2 ? KEY_B : KEY_A }) });
+    expect(result.provider.models).toEqual([]); expect(result.outcomes[0].status).toBe("unavailable");
+    expect(calls).toHaveLength(3);
+  }));
+  it("retries with the new endpoint after a configuration change during I/O", async () => withGateway(async (first) => withGateway(async (second) => {
+    const ctx = catalogCtx(first.baseUrl);
+    first.setHandler((_req, res) => { ctx.config = config(second.baseUrl); json(res, { data: [{ id: "vendor/old" }] }); });
+    second.setHandler((_req, res) => json(res, { data: [{ id: "vendor/new" }] }));
+    const result = await catalog(registered().provider, ctx);
+    expect(result.provider.baseUrl).toBe(second.baseUrl);
+    expect(result.provider.models.map((m: any) => m.id)).toEqual(["vendor/new"]);
+    expect(first.calls).toHaveLength(1); expect(second.calls).toHaveLength(1);
+  })));
+  it("rejects static rows in the live namespace", async () => withGateway(async ({ baseUrl, calls }) => {
+    const ctx = { ...catalogCtx(baseUrl), config: { ...config(baseUrl), models: { providers: { "bifrost-live": {
+      baseUrl, models: [{ id: "vendor/revoked" }],
+    } } } } };
+    const { provider, warn } = registered();
+    expect((await catalog(provider, ctx)).provider.models).toEqual([]); expect(calls).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("remove static models"));
+    await expect(provider.prepareDynamicModel!({ ...runtimeCtx(baseUrl), config: ctx.config } as never)).rejects.toThrow("remove static models");
+  }));
+  it("refuses conflicting live endpoints before sending a key", async () => withGateway(async ({ baseUrl, calls }) => {
+    const result = await catalog(registered().provider, { ...catalogCtx(baseUrl), config: { ...config(baseUrl),
+      models: { providers: { "bifrost-live": { baseUrl: "https://different.invalid/v1", models: [] } } } } });
+    expect(result.provider.models).toEqual([]); expect(calls).toHaveLength(0);
+  }));
+  it("does not send a key when inference points to a different gateway", async () => withGateway(async ({ baseUrl, calls }) => {
+    const { provider } = registered();
+    await expect(provider.prepareRuntimeAuth!({ ...runtimeCtx(baseUrl), apiKey: KEY_A,
+      model: { baseUrl: "https://different.invalid/v1" }, env: {} } as never)).rejects.toThrow("route changed");
+    expect(calls).toHaveLength(0);
+  }));
+  it("skips catalogs scoped to other providers", async () => {
+    expect(await catalog(registered().provider, { providerIds: ["bifrost"], config: {} })).toBeNull();
   });
 });

@@ -1,21 +1,23 @@
 {
   "name": "openclaw-plugin-bifrost",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenClaw provider plugin for the Bifrost AI gateway, with live model discovery.",
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run --config ./vitest.config.ts",
     "validate": "npm run build && clawhub package validate . --out .clawhub-validation",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test:native": "npm run build && node scripts/native-smoke.mjs"
   },
   "files": [
     "dist",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "docs"
   ],
   "peerDependencies": {
-    "openclaw": ">=2026.9.1"
+    "openclaw": ">=2026.10.9"
   },
   "peerDependenciesMeta": {
     "openclaw": {
@@ -24,7 +26,7 @@
   },
   "devDependencies": {
     "clawhub": "latest",
-    "openclaw": "latest",
+    "openclaw": "2026.10.9",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
   },
@@ -33,15 +35,15 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.9.1"
+      "pluginApi": ">=2026.10.9"
     },
     "build": {
-      "openclawVersion": "2026.9.1"
+      "openclawVersion": "2026.10.9"
     },
     "install": {
       "clawhubSpec": "clawhub:openclaw-plugin-bifrost",
       "defaultChoice": "clawhub",
-      "minHostVersion": ">=2026.9.1"
+      "minHostVersion": ">=2026.10.9"
     },
     "release": {
       "publishToClawHub": true
@@ -70,5 +72,8 @@
     "ai-gateway",
     "provider"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.22.1 <25 || >=26.12.1"
+  }
 }
